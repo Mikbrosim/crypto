@@ -1,0 +1,1947 @@
+Absolutely. Below is a Codex-ready implementation specification you can paste directly into a coding agent.
+
+# SageMath Hyperelliptic Utility Toolkit
+
+## Goal
+
+Implement a reusable SageMath-focused Python toolkit for:
+
+1. polynomial square roots modulo arbitrary polynomial moduli,
+2. polynomial Hensel lifting,
+3. polynomial CRT,
+4. recovering Mumford `v` coordinates from `u`,
+5. reconstructing a Jacobian L-polynomial/order from extension-field point counts,
+6. efficiently computing Jacobian orders for the special family
+
+\[
+C:\quad y^2+h\,y=x^n
+\]
+
+where:
+
+- `h` is a constant,
+- `n = 2g + 1` is an odd prime,
+- `p` is an odd prime,
+- `p % n == 1`.
+
+The implementation should prioritize correctness, reusable components, explicit assumptions, validation, and testability.
+
+The code is intended primarily for CTF and computational number theory work in SageMath.
+
+---
+
+# 1. Package structure
+
+Use this layout:
+
+```text
+hyperelliptic_utils/
+    __init__.py
+    polynomial.py
+    mumford.py
+    pointcount.py
+    jacobi.py
+
+tests/
+    test_polynomial.py
+    test_mumford.py
+    test_pointcount.py
+    test_jacobi.py
+```
+
+Public functions should be exported through:
+
+```python
+hyperelliptic_utils/__init__.py
+```
+
+Suggested public API:
+
+```python
+from .polynomial import (
+    poly_crt,
+    poly_sqrt_mod,
+)
+
+from .mumford import (
+    recover_mumford_v,
+)
+
+from .pointcount import (
+    jacobian_order_from_point_counts,
+)
+
+from .jacobi import (
+    jacobian_order_y2_hy_xn,
+)
+```
+
+Internal helpers should begin with `_`.
+
+---
+
+# 2. General coding requirements
+
+Use SageMath types whenever possible.
+
+Expected imports:
+
+```python
+from sage.all import *
+from itertools import product
+```
+
+Do not reconstruct a finite field manually from implementation details such as:
+
+```python
+M.base_ring().modulus()
+```
+
+Instead use:
+
+```python
+R = M.parent()
+F = R.base_ring()
+p = F.characteristic()
+```
+
+Always coerce inputs into a common parent where sensible.
+
+Example:
+
+```python
+R = M.parent()
+f = R(f)
+M = R(M)
+```
+
+Use exact arithmetic only.
+
+No floating-point approximations should be needed.
+
+Every mathematical result should optionally be validated with assertions or a `verify=True` parameter.
+
+Raise useful exceptions rather than silently returning incorrect values.
+
+Characteristic 2 should explicitly raise `NotImplementedError` where the implemented algorithm assumes `2` is invertible.
+
+---
+
+# 3. Polynomial CRT
+
+File:
+
+```text
+polynomial.py
+```
+
+Implement:
+
+```python
+def poly_crt(values, moduli, *, verify=False):
+    """
+    Solve simultaneous polynomial congruences
+
+        x == values[i] mod moduli[i]
+
+    for pairwise-coprime polynomial moduli.
+
+    Return the canonical remainder modulo product(moduli).
+    """
+```
+
+## Requirements
+
+Inputs:
+
+```python
+values: sequence of polynomials/coercible values
+moduli: sequence of polynomials
+```
+
+All moduli must:
+
+- have the same polynomial parent,
+- be nonconstant,
+- be pairwise coprime.
+
+Algorithm:
+
+For
+
+\[
+M=\prod_i m_i,
+\]
+
+set
+
+\[
+M_i=M/m_i,
+\]
+
+and compute
+
+\[
+e_i=M_i(M_i^{-1}\bmod m_i).
+\]
+
+Then
+
+\[
+x=\sum_i a_i e_i\pmod M.
+\]
+
+Implementation:
+
+```python
+M = prod(moduli)
+out = R.zero()
+
+for a, m in zip(values, moduli):
+    Mi = M // m
+    out += a * Mi * Mi.inverse_mod(m)
+
+out %= M
+```
+
+If `verify=True`, assert:
+
+```python
+out % m == a % m
+```
+
+for each pair.
+
+Edge cases:
+
+- empty input: raise `ValueError`
+- mismatched lengths: raise `ValueError`
+- non-coprime moduli: raise `ValueError`
+
+---
+
+# 4. Polynomial valuation
+
+Implement internal helper:
+
+```python
+def _poly_valuation(f, q, max_exp=None):
+    """
+    Return v_q(f), optionally capped at max_exp.
+    """
+```
+
+Assume `q` is irreducible.
+
+For zero:
+
+- if `max_exp` is provided, return `max_exp`
+- otherwise raise or return Sage Infinity
+
+Prefer predictable behavior for use inside lifting routines.
+
+Repeatedly divide by `q` while divisible.
+
+---
+
+# 5. Residue class enumeration
+
+Implement internal helper:
+
+```python
+def _residue_representatives(q, exponent):
+    """
+    Yield canonical representatives of R/(q^exponent).
+    """
+```
+
+This is only for singular square-root cases where explicit enumeration is required.
+
+If:
+
+```python
+deg(q) = d
+|F| = Q
+```
+
+then:
+
+\[
+|R/(q^e)|=Q^{de}.
+\]
+
+Generate all polynomials of degree less than:
+
+```python
+q.degree() * exponent
+```
+
+over the base field.
+
+This can explode exponentially.
+
+Never call it without first checking a `max_roots` or equivalent bound.
+
+---
+
+# 6. Square root modulo an irreducible polynomial
+
+Implement:
+
+```python
+def _sqrt_mod_irreducible(f, q):
+    """
+    Return all r with
+
+        r^2 == f mod q
+
+    where q is irreducible.
+
+    Returned roots are polynomials of degree < deg(q).
+    """
+```
+
+Let:
+
+```python
+R = q.parent()
+F = R.base_ring()
+```
+
+Construct:
+
+\[
+K=F[x]/(q).
+\]
+
+Recommended Sage construction:
+
+```python
+K = F.extension(q, names="a")
+a = K.gen()
+```
+
+Reduce `f` modulo `q` and evaluate it in `K`.
+
+Do not assume direct coercion always works.
+
+Safe conversion:
+
+```python
+fq = f % q
+fq_K = sum(K(c) * a**i for i, c in enumerate(fq.list()))
+```
+
+Then:
+
+```python
+roots_K = fq_K.sqrt(all=True)
+```
+
+Convert each root back to `R` using its polynomial representation.
+
+Example:
+
+```python
+R(root.polynomial().list())
+```
+
+Return a list.
+
+---
+
+# 7. Nonsingular Hensel lifting for polynomial square roots
+
+Implement:
+
+```python
+def _hensel_lift_square_root(f, q, exponent, root):
+    """
+    Lift a nonsingular solution
+
+        root^2 == f mod q
+
+    to a solution modulo q^exponent.
+    """
+```
+
+Assume:
+
+- odd characteristic,
+- `q` irreducible,
+- `root != 0 mod q`,
+- therefore `2*root` is invertible modulo `q`.
+
+Suppose:
+
+\[
+r_k^2\equiv f\pmod{q^k}.
+\]
+
+Seek:
+
+\[
+r_{k+1}=r_k+q^k t.
+\]
+
+Then:
+
+\[
+t\equiv
+\frac{f-r_k^2}{q^k}(2r_k)^{-1}
+\pmod q.
+\]
+
+Implementation loop from `k = 1` to `exponent - 1`.
+
+After every lift optionally assert:
+
+```python
+(root**2 - f) % q**(k + 1) == 0
+```
+
+---
+
+# 8. Square roots modulo an irreducible prime power
+
+Implement:
+
+```python
+def _sqrt_mod_prime_power(
+    f,
+    q,
+    exponent,
+    *,
+    all_roots=True,
+    max_roots=100000,
+    verify=True,
+):
+    """
+    Solve
+
+        w^2 == f mod q^exponent
+
+    for irreducible q over a finite field of odd characteristic.
+    """
+```
+
+This must support both nonsingular and singular cases.
+
+Let:
+
+\[
+s=\min(v_q(f),e).
+\]
+
+where:
+
+```text
+e = exponent
+```
+
+## Case A: `s == e`
+
+Then:
+
+\[
+f\equiv0\pmod{q^e}.
+\]
+
+A solution satisfies:
+
+\[
+v_q(w)\ge\lceil e/2\rceil.
+\]
+
+So:
+
+\[
+w=q^{\lceil e/2\rceil}z,
+\]
+
+where:
+
+\[
+z\bmod q^{\lfloor e/2\rfloor}
+\]
+
+is arbitrary.
+
+If `all_roots=False`, simply return `[0]` or one representative.
+
+If all roots are requested:
+
+1. calculate the number of possibilities,
+2. compare against `max_roots`,
+3. enumerate only if safe.
+
+---
+
+## Case B: `s < e` and `s` is odd
+
+Return no roots.
+
+Reason:
+
+\[
+v_q(w^2)
+\]
+
+must be even.
+
+---
+
+## Case C: `s = 2t < e`
+
+Write:
+
+\[
+f=q^{2t}u
+\]
+
+with:
+
+\[
+q\nmid u.
+\]
+
+Set:
+
+\[
+m=e-2t.
+\]
+
+Solve:
+
+\[
+y^2\equiv u\pmod{q^m}.
+\]
+
+Because `u` is a unit, every solution modulo `q` is nonsingular and lifts uniquely to modulo `q^m`.
+
+Then every solution modulo `q^e` is:
+
+\[
+w=q^t(y+q^m a)
+\]
+
+where:
+
+\[
+a\bmod q^t.
+\]
+
+Enumerate `a` only when `all_roots=True`.
+
+Respect `max_roots`.
+
+---
+
+# 9. Generic polynomial square root modulo M
+
+Public function:
+
+```python
+def poly_sqrt_mod(
+    f,
+    M,
+    *,
+    all_roots=True,
+    max_roots=100000,
+    verify=True,
+):
+    """
+    Solve
+
+        w^2 == f mod M
+
+    over a finite field of odd characteristic.
+
+    Supports repeated irreducible factors.
+    """
+```
+
+Requirements:
+
+- finite field base ring,
+- characteristic not 2,
+- `M` nonzero and positive degree.
+
+Normalize:
+
+```python
+M = M.monic()
+```
+
+Factor:
+
+\[
+M=\prod_i q_i^{e_i}.
+\]
+
+For each prime power:
+
+```python
+roots_i = _sqrt_mod_prime_power(...)
+```
+
+If any local factor has zero roots, return:
+
+```python
+[]
+```
+
+or:
+
+```python
+None
+```
+
+when `all_roots=False`.
+
+Combine independent local solutions using `poly_crt`.
+
+The CRT moduli are:
+
+```python
+q_i ** e_i
+```
+
+When `all_roots=False`, combine the first available local root.
+
+When all roots are requested:
+
+```python
+for roots in product(*local_roots):
+    ...
+```
+
+Before enumerating combinations, calculate:
+
+```python
+prod(len(r) for r in local_roots)
+```
+
+and enforce `max_roots`.
+
+Final verification:
+
+```python
+assert (w**2 - f) % M == 0
+```
+
+---
+
+# 10. Recover Mumford v from u
+
+File:
+
+```text
+mumford.py
+```
+
+Implement:
+
+```python
+def recover_mumford_v(
+    f,
+    h,
+    u,
+    *,
+    all_roots=True,
+    max_roots=100000,
+    verify=True,
+):
+    """
+    Recover v satisfying
+
+        u | f - h*v - v^2
+
+    for the hyperelliptic model
+
+        y^2 + h(x)y = f(x)
+
+    over odd characteristic.
+    """
+```
+
+Use the identity:
+
+\[
+v^2+h v-f\equiv0\pmod u.
+\]
+
+Multiply by 4:
+
+\[
+(2v+h)^2\equiv h^2+4f\pmod u.
+\]
+
+Set:
+
+\[
+w=2v+h.
+\]
+
+Then:
+
+\[
+w^2\equiv h^2+4f\pmod u.
+\]
+
+Compute:
+
+```python
+rhs = h**2 + 4*f
+ws = poly_sqrt_mod(rhs, u, ...)
+```
+
+Recover:
+
+\[
+v=\frac{w-h}{2}\pmod u.
+\]
+
+Use:
+
+```python
+inv2 = F(2)**-1
+v = ((w - h) * inv2) % u
+```
+
+Verify:
+
+```python
+(f - h*v - v**2) % u == 0
+```
+
+This function must allow:
+
+- `h = 0`
+- `h = 1`
+- arbitrary polynomial `h(x)`
+
+provided characteristic is odd.
+
+Characteristic 2:
+
+```python
+raise NotImplementedError
+```
+
+---
+
+# 11. Jacobian order from extension point counts
+
+File:
+
+```text
+pointcount.py
+```
+
+Implement:
+
+```python
+def jacobian_order_from_point_counts(q, genus, counts):
+    """
+    Reconstruct the curve L-polynomial and Jacobian order from
+
+        counts[m-1] = #C(F_{q^m})
+
+    for m = 1,...,genus.
+
+    Return:
+
+        (order, L)
+    """
+```
+
+For:
+
+\[
+L(T)=\prod_{i=1}^{2g}(1-\alpha_iT)
+\]
+
+define:
+
+\[
+S_m=\sum_i\alpha_i^m.
+\]
+
+From point counts:
+
+\[
+S_m=q^m+1-N_m.
+\]
+
+If:
+
+\[
+L(T)=1+c_1T+\cdots+c_{2g}T^{2g},
+\]
+
+Newton identities give:
+
+\[
+k c_k+\sum_{i=1}^k c_{k-i}S_i=0.
+\]
+
+Thus:
+
+\[
+c_k=
+-\frac{1}{k}
+\sum_{i=1}^k c_{k-i}S_i.
+\]
+
+Calculate coefficients `c_0,...,c_g`.
+
+Use the functional equation:
+
+\[
+c_{2g-k}=q^{g-k}c_k.
+\]
+
+Build the complete degree `2g` polynomial over `ZZ`.
+
+Return:
+
+\[
+\#J(\mathbf F_q)=L(1).
+\]
+
+Checks:
+
+- exactly or at least `genus` point counts required,
+- Newton divisions must divide exactly,
+- optionally validate:
+  - constant coefficient is `1`,
+  - leading coefficient is `q**g`.
+
+---
+
+# 12. Special Jacobi-sum Jacobian order
+
+File:
+
+```text
+jacobi.py
+```
+
+Implement public function:
+
+```python
+def jacobian_order_y2_hy_xn(
+    p,
+    n,
+    h=1,
+    *,
+    proof=False,
+    normalize_h0=True,
+    return_details=False,
+):
+    """
+    Compute #Jac(F_p) for
+
+        C: y^2 + h*y = x^n
+
+    where h is constant.
+
+    Assumptions:
+        - p odd prime
+        - n odd prime
+        - n = 2g + 1
+        - p % n == 1
+    """
+```
+
+This is not a generic hyperelliptic Jacobian-order function.
+
+It is specifically for:
+
+\[
+y^2+h y=x^n.
+\]
+
+---
+
+# 13. Constant h = 0 behavior
+
+If:
+
+```python
+h == 0
+```
+
+the equation is:
+
+\[
+y^2=x^n.
+\]
+
+For odd `n > 1`, this curve is singular at `(0,0)`.
+
+Its normalization is rational:
+
+\[
+x=t^2,\qquad y=t^n.
+\]
+
+Therefore its normalized Jacobian is trivial and has order:
+
+\[
+1.
+\]
+
+Behavior:
+
+If:
+
+```python
+normalize_h0=True
+```
+
+return:
+
+```python
+1
+```
+
+If:
+
+```python
+normalize_h0=False
+```
+
+raise:
+
+```python
+ValueError
+```
+
+with a message explaining that the input curve is singular.
+
+When `return_details=True`, return something such as:
+
+```python
+{
+    "order": ZZ(1),
+    "jacobi_sum": None,
+    "twist": None,
+    "singular": True,
+}
+```
+
+Prefer a dictionary or dataclass over an unexplained tuple for detailed mode.
+
+---
+
+# 14. Primitive nth root in F_p
+
+Implement internal helper:
+
+```python
+def _find_nth_root_of_unity(Fp, n):
+    """
+    Return (alpha, r) where
+
+        r = alpha^((p-1)/n)
+
+    has exact order n.
+    """
+```
+
+Because `n` is prime, any nontrivial `n`-th root has order exactly `n`.
+
+Do not require factoring `p - 1`.
+
+Algorithm:
+
+```python
+e = (p - 1) // n
+
+for a in 2, 3, ...:
+    r = Fp(a)**e
+    if r != 1:
+        return Fp(a), r
+```
+
+Validate:
+
+```python
+r**n == 1
+r != 1
+```
+
+---
+
+# 15. Cyclotomic Galois automorphism
+
+Implement:
+
+```python
+def _cyclotomic_sigma(a, k, n=None):
+    """
+    Apply sigma_k:
+
+        zeta -> zeta^k
+
+    to an element of Q(zeta_n).
+    """
+```
+
+Assume `a.parent()` is a cyclotomic field.
+
+Use:
+
+```python
+K = a.parent()
+z = K.gen()
+return K(a.polynomial()(z**k))
+```
+
+Reduce:
+
+```python
+k %= n
+```
+
+Make this helper well tested because errors here produce plausible but wrong Jacobi sums.
+
+---
+
+# 16. Construct prime ideal above p
+
+For:
+
+\[
+K=\mathbf Q(\zeta_n),
+\]
+
+and:
+
+\[
+r\in\mathbf F_p,\qquad r^n=1,
+\]
+
+construct:
+
+\[
+\mathfrak p=(p,\zeta_n-r).
+\]
+
+Helper:
+
+```python
+def _cyclotomic_prime_above_p(K, p, r):
+    z = K.gen()
+    P = K.ideal(p, z - ZZ(r))
+    assert P.norm() == p
+    return P
+```
+
+---
+
+# 17. Find principal generator
+
+Implement helper:
+
+```python
+def _principal_generator_reduced(P, *, proof=False):
+    """
+    Return beta such that
+
+        (beta) = P.
+
+    Raise if P is not principal.
+    """
+```
+
+Try:
+
+```python
+gens = P.gens_reduced(proof=proof)
+```
+
+Expected simple case:
+
+```python
+len(gens) == 1
+```
+
+Then:
+
+```python
+beta = P.number_field()(gens[0])
+```
+
+Verify:
+
+```python
+K.ideal(beta) == P
+abs(beta.norm()) == P.norm()
+```
+
+If this fails, raise a clear error saying the compact implementation currently assumes the relevant ideal is principal.
+
+For `n=11`, this should be suitable.
+
+---
+
+# 18. Construct Jacobi sum
+
+For:
+
+\[
+g=(n-1)/2,
+\]
+
+and principal generator:
+
+\[
+(\beta)=\mathfrak p,
+\]
+
+construct:
+
+\[
+J_0=
+\prod_{i=1}^{g}
+\sigma_{i^{-1}}(\beta),
+\]
+
+where:
+
+\[
+i^{-1}
+\]
+
+is modulo `n`.
+
+Implementation:
+
+```python
+J0 = K.one()
+
+for i in range(1, g + 1):
+    j = inverse_mod(ZZ(i), n)
+    J0 *= _cyclotomic_sigma(beta, j)
+```
+
+Validate the expected norm/absolute-value relation:
+
+\[
+J_0\overline{J_0}=p.
+\]
+
+If it does not hold exactly, do not continue silently.
+
+Raise a useful exception.
+
+---
+
+# 19. Normalize the Jacobi sum
+
+The actual Jacobi sum differs from `J0` by a root of unity.
+
+For odd prime `n`, roots of unity in:
+
+\[
+\mathbf Q(\zeta_n)
+\]
+
+are:
+
+\[
+\pm\zeta^k,\qquad 0\le k<n.
+\]
+
+Use:
+
+\[
+J(\chi,\chi)\equiv-1
+\pmod{(\zeta-1)^2}.
+\]
+
+Construct:
+
+```python
+lam2 = K.ideal((z - 1)**2)
+```
+
+Test all:
+
+```python
+sign * z**k * J0
+```
+
+for:
+
+```python
+sign in (1, -1)
+k in range(n)
+```
+
+Select the unique candidate satisfying:
+
+```python
+candidate + 1 in lam2
+```
+
+Require exactly one result.
+
+Otherwise raise.
+
+---
+
+# 20. Twist handling for arbitrary nonzero constant h
+
+The base curve is:
+
+\[
+y^2+h y=x^n.
+\]
+
+For:
+
+\[
+h\neq0,
+\]
+
+substitute:
+
+\[
+y=h v.
+\]
+
+Then:
+
+\[
+h^2(v^2+v)=x^n,
+\]
+
+hence:
+
+\[
+v^2+v=h^{-2}x^n.
+\]
+
+Set:
+
+\[
+A=h^{-2}.
+\]
+
+Let `alpha` be the field element used when constructing:
+
+\[
+r=\alpha^{(p-1)/n}.
+\]
+
+Determine the twist class `j` satisfying:
+
+\[
+A\in\alpha^j(\mathbf F_p^\times)^n.
+\]
+
+Raise both sides to:
+
+\[
+e=(p-1)/n.
+\]
+
+Then:
+
+\[
+A^e=r^j.
+\]
+
+Since there are only `n` possibilities, brute-force:
+
+```python
+target = A**e
+cur = Fp.one()
+
+for j in range(n):
+    if cur == target:
+        twist_j = j
+        break
+    cur *= r
+```
+
+No discrete logarithm algorithm is needed because `n` is small.
+
+---
+
+# 21. Jacobian order from Jacobi sum
+
+For twist `j`, use:
+
+\[
+\boxed{
+\#J(\mathbf F_p)
+=
+N_{\mathbf Q(\zeta_n)/\mathbf Q}
+\left(J(\chi,\chi)+\zeta_n^j\right).
+}
+\]
+
+Implementation:
+
+```python
+order = abs(
+    ZZ((Jchi + z**twist_j).norm())
+)
+```
+
+For:
+
+```python
+h == 1
+```
+
+we have:
+
+\[
+h^{-2}=1,
+\]
+
+so:
+
+```python
+twist_j == 0
+```
+
+and:
+
+\[
+\#J=
+N(J+1).
+\]
+
+---
+
+# 22. Detailed return type
+
+Consider using a dataclass:
+
+```python
+@dataclass
+class JacobiOrderResult:
+    order: Integer
+    jacobi_sum: object
+    twist: int | None
+    primitive_root: object | None
+    cyclotomic_root: object | None
+    singular: bool
+```
+
+Then:
+
+```python
+return_details=False
+```
+
+returns only `order`.
+
+With:
+
+```python
+return_details=True
+```
+
+return `JacobiOrderResult`.
+
+This is preferable for debugging CTF challenges.
+
+---
+
+# 23. Optional verification against a divisor
+
+Do not make this mandatory because it requires a curve/Jacobian object.
+
+Optional utility:
+
+```python
+def verify_jacobian_order(J, order, divisors):
+    """
+    Verify that
+
+        order * D == 0
+
+    for each supplied divisor D.
+    """
+```
+
+This does not prove the order is exact, but is a useful consistency check.
+
+For a CTF:
+
+```python
+assert order * ciphertext_divisor == J(0)
+```
+
+is strongly recommended.
+
+---
+
+# 24. Tests: polynomial CRT
+
+Use small fields.
+
+Example:
+
+```python
+F = GF(101)
+R.<x> = PolynomialRing(F)
+
+m1 = x + 1
+m2 = x^2 + 2
+```
+
+Choose residues and verify returned solution modulo both.
+
+Also test:
+
+- three moduli,
+- mismatched list lengths,
+- non-coprime moduli.
+
+---
+
+# 25. Tests: square-free polynomial square roots
+
+Construct a random polynomial `a` and define:
+
+```python
+f = a**2 % M
+```
+
+with square-free:
+
+```python
+M = q1*q2*q3
+```
+
+where factors have mixed degrees.
+
+Verify every returned root satisfies:
+
+```python
+(r**2 - f) % M == 0
+```
+
+Verify expected number of roots where known.
+
+---
+
+# 26. Tests: repeated factors
+
+Test:
+
+```python
+M = q**4
+f = a**2 % M
+```
+
+for irreducible `q`.
+
+Verify Hensel-lifted roots.
+
+Also test:
+
+```python
+M = q1**3 * q2**2
+```
+
+to ensure prime-power solving and CRT composition both work.
+
+---
+
+# 27. Tests: singular square-root lifting
+
+Explicitly test:
+
+\[
+f=q^{2t}u.
+\]
+
+Examples:
+
+```python
+M = q**5
+a = q*(x + c)
+f = a**2 % M
+```
+
+Verify all roots.
+
+Also test an odd valuation:
+
+```python
+f = q * u
+```
+
+with `u` a unit.
+
+Expected:
+
+```python
+[]
+```
+
+---
+
+# 28. Tests: zero square root case
+
+For:
+
+```python
+f = 0
+M = q**e
+```
+
+verify the returned roots are exactly those divisible by:
+
+\[
+q^{\lceil e/2\rceil}.
+\]
+
+Use very small finite fields so enumeration stays manageable.
+
+---
+
+# 29. Tests: Mumford recovery
+
+Generate a known:
+
+```python
+v
+```
+
+and define a modulus `u` satisfying:
+
+```python
+(f - h*v - v**2) % u == 0
+```
+
+Then call:
+
+```python
+recover_mumford_v(f, h, u)
+```
+
+Verify the original `v mod u` appears in the returned list.
+
+Test separately:
+
+```python
+h = 0
+h = 1
+h = x + 3
+```
+
+over odd characteristic.
+
+---
+
+# 30. Tests: point-count reconstruction
+
+Use small hyperelliptic curves where Sage can compute extension counts directly.
+
+Example workflow:
+
+```python
+C = HyperellipticCurve(...)
+g = C.genus()
+
+counts = C.count_points(g)
+
+order, L = jacobian_order_from_point_counts(
+    C.base_ring().order(),
+    g,
+    counts,
+)
+```
+
+Compare against Sage's direct Jacobian cardinality when available:
+
+```python
+assert order == C.jacobian().cardinality()
+```
+
+or compare `L` with Sage's Frobenius polynomial after accounting for polynomial conventions.
+
+Test genus 1, 2, and possibly 3.
+
+---
+
+# 31. Tests: Jacobi-sum method
+
+Use small primes first.
+
+Choose:
+
+```text
+n = 3
+n = 5
+n = 7
+n = 11
+```
+
+and small primes satisfying:
+
+```python
+p % n == 1
+```
+
+Construct:
+
+```python
+C = HyperellipticCurve(x**n, h)
+```
+
+for nonzero constant `h`.
+
+Compare:
+
+```python
+jacobian_order_y2_hy_xn(p, n, h)
+```
+
+against Sage's direct point-count/Jacobian-order result.
+
+Test several different nonzero `h`.
+
+Verify that values of `h` in the same twist class produce equal orders.
+
+---
+
+# 32. Tests: h = 0
+
+Call:
+
+```python
+jacobian_order_y2_hy_xn(p, n, 0)
+```
+
+Expected:
+
+```python
+1
+```
+
+when:
+
+```python
+normalize_h0=True
+```
+
+Expected exception when:
+
+```python
+normalize_h0=False
+```
+
+The documentation must clearly state that this refers to the normalization, because:
+
+\[
+y^2=x^n
+\]
+
+is singular.
+
+---
+
+# 33. CTF example
+
+Include an example script:
+
+```python
+from sage.all import *
+from hyperelliptic_utils import *
+
+p = ...
+n = 11
+
+R.<x> = PolynomialRing(GF(p))
+
+Du = R([...])
+
+# Recover possible D_v values.
+Dv_candidates = recover_mumford_v(
+    x**11,
+    1,
+    Du,
+)
+
+e_candidates = [
+    ZZ(v[0])
+    for v in Dv_candidates
+]
+
+# Compute Jacobian order.
+N = jacobian_order_y2_hy_xn(
+    p,
+    11,
+    1,
+)
+
+# Ciphertext Mumford pair.
+cu = R([...])
+cv = R([...])
+
+H = HyperellipticCurve(x**11, 1)
+J = H.jacobian()
+J = J(J.base_ring())
+
+ct = J([cu, cv])
+
+assert N * ct == J(0)
+
+for e in e_candidates:
+    if gcd(e, N) != 1:
+        continue
+
+    P = inverse_mod(e, N) * ct
+
+    if P[0].degree() == 1:
+        print("possible plaintext:", P)
+```
+
+Keep this example separate from library internals.
+
+---
+
+# 34. Documentation warnings
+
+Document the following clearly.
+
+## `poly_sqrt_mod`
+
+Implemented only for finite fields of odd characteristic.
+
+Repeated polynomial factors are supported.
+
+Singular roots may create an enormous number of solutions.
+
+Therefore `max_roots` is essential.
+
+---
+
+## `recover_mumford_v`
+
+Works for arbitrary polynomial `h(x)` only in odd characteristic.
+
+Uses:
+
+\[
+(2v+h)^2=h^2+4f\pmod u.
+\]
+
+Characteristic 2 requires a different implementation.
+
+---
+
+## `jacobian_order_from_point_counts`
+
+Mathematically general, but obtaining the point counts may be computationally expensive.
+
+The helper only reconstructs the L-polynomial from known counts.
+
+---
+
+## `jacobian_order_y2_hy_xn`
+
+This is NOT a generic Jacobian point-counting algorithm.
+
+It applies specifically to:
+
+\[
+y^2+h y=x^n
+\]
+
+with constant `h`, odd prime `n`, and:
+
+\[
+p\equiv1\pmod n.
+\]
+
+For nonzero `h`, it uses the Jacobi-sum/twist structure.
+
+For `h=0`, the curve is singular and the function returns the Jacobian order of its normalization only if explicitly allowed.
+
+The current compact implementation assumes that the relevant prime ideal in the cyclotomic field is principal.
+
+If principal ideal generation fails, raise an informative exception rather than attempting an incorrect fallback.
+
+---
+
+# 35. Style requirements
+
+Use descriptive variable names.
+
+Avoid reusing `x` for:
+
+- polynomial generators,
+- field elements,
+- integers,
+- multivariate variables.
+
+Prefer:
+
+```python
+X
+field_element
+root
+modulus
+```
+
+Add type hints where they do not interfere with Sage types.
+
+Use mathematical docstrings containing both:
+
+- the equation being solved,
+- assumptions required by the algorithm.
+
+Keep public functions reasonably compact.
+
+Put complicated mathematics into internal helpers.
+
+---
+
+# 36. Desired public API
+
+The final package should support:
+
+```python
+# Polynomial CRT
+x = poly_crt(values, moduli)
+
+# Polynomial square roots
+roots = poly_sqrt_mod(f, M)
+
+# One root only
+root = poly_sqrt_mod(
+    f,
+    M,
+    all_roots=False,
+)
+
+# Recover Mumford v
+vs = recover_mumford_v(
+    f,
+    h,
+    u,
+)
+
+# Reconstruct Jacobian order from point counts
+order, L = jacobian_order_from_point_counts(
+    q,
+    genus,
+    counts,
+)
+
+# Fast special-family order
+order = jacobian_order_y2_hy_xn(
+    p,
+    n,
+    h,
+)
+```
+
+---
+
+# 37. Implementation order
+
+Implement in this sequence:
+
+```text
+1. poly_crt
+2. _poly_valuation
+3. _sqrt_mod_irreducible
+4. _hensel_lift_square_root
+5. _sqrt_mod_prime_power
+6. poly_sqrt_mod
+7. recover_mumford_v
+8. jacobian_order_from_point_counts
+9. cyclotomic/Jacobi helpers
+10. jacobian_order_y2_hy_xn
+11. tests
+12. documentation/example
+```
+
+Do not implement the Jacobi-sum code until polynomial and Mumford tests pass.
+
+---
+
+# 38. Correctness priorities
+
+In order of priority:
+
+1. exact mathematical correctness,
+2. explicit assumptions,
+3. verification assertions,
+4. useful exceptions,
+5. reusable helper design,
+6. speed.
+
+Do not optimize away validation until tests demonstrate correctness.
+
+Avoid clever one-liners in the cyclotomic code.
+
+That code should make the mathematical sequence obvious:
+
+```text
+find root of unity
+    ↓
+construct prime ideal above p
+    ↓
+find principal generator
+    ↓
+apply Galois conjugates
+    ↓
+construct Jacobi sum up to root of unity
+    ↓
+normalize Jacobi sum
+    ↓
+identify twist class
+    ↓
+take algebraic norm
+    ↓
+Jacobian order
+```
+
+---
+
+# 39. Mathematical references to mention in comments/docs
+
+For the special-family Jacobian-order algorithm, mention that the implementation follows the Jacobi-sum / cyclotomic method associated with Buhler and Koblitz for curves of the form
+
+\[
+y^2+y=x^n
+\]
+
+and their twists.
+
+No external network access should be required at runtime.
+
+---
+
+# 40. Final acceptance criteria
+
+The implementation is complete when:
+
+- `poly_sqrt_mod` works for square-free and repeated polynomial moduli,
+- nonsingular and singular Hensel cases are tested,
+- `recover_mumford_v` works for arbitrary `h(x)` in odd characteristic,
+- `jacobian_order_from_point_counts` agrees with Sage on small curves,
+- `jacobian_order_y2_hy_xn` agrees with Sage on small test instances,
+- constant nonzero `h` twist handling is validated,
+- `h=0` is explicitly handled as a singular normalization case,
+- the original `n=11` CTF instance can use the toolkit to:
+  - recover the candidate leaked scalars,
+  - compute the Jacobian order,
+  - invert the scalar multiplication.
+
+I’d have Codex implement this in stages and run the small-field tests before trying your 512-bit CTF instance; the cyclotomic code is the part where subtle convention mistakes are easiest to hide.
